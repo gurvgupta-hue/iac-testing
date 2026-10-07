@@ -1,60 +1,111 @@
 terraform {
   required_providers {
-    azurerm = {
-      source  = "hashicorp/azurerm"
-      version = "~> 3.0"
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
     }
   }
 }
 
-provider "azurerm" {
-  features {}
-  client_secret = "SuperSecretClientKey123!"  # FLAW: hardcoded secret
+provider "aws" {
+  region     = "us-east-1"
+  access_key = "AKIAIOSFODNN7EXAMPLE"          # FLAW: hardcoded credentials
+  secret_key = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"  # FLAW: hardcoded credentials
 }
 
-resource "azurerm_resource_group" "test" {
-  name     = "iac-test-rg"
-  location = "East US"
+# FLAW: S3 bucket is public and unencrypted, no versioning
+resource "aws_s3_bucket" "data" {
+  bucket = "iac-test-flawed-bucket"
 }
 
-# FLAW: storage account allows public blob access, uses old TLS
-resource "azurerm_storage_account" "flawed" {
-  name                     = "iactestflawedsa"
-  resource_group_name      = azurerm_resource_group.test.name
-  location                 = azurerm_resource_group.test.location
-  account_tier             = "Standard"
-  account_replication_type = "LRS"
-
-  allow_nested_items_to_be_public = true   # FLAW: should be false
-  min_tls_version                 = "TLS1_0"  # FLAW: should be TLS1_2
+resource "aws_s3_bucket_public_access_block" "data" {
+  bucket                  = aws_s3_bucket.data.id
+  block_public_acls       = false  # FLAW: should be true
+  block_public_policy     = false  # FLAW: should be true
+  ignore_public_acls      = false
+  restrict_public_buckets = false
 }
 
-# FLAW: NSG open to internet on management ports
-resource "azurerm_network_security_group" "flawed" {
-  name                = "iac-test-nsg"
-  location            = azurerm_resource_group.test.location
-  resource_group_name  = azurerm_resource_group.test.name
+# FLAW: security group open to the world on SSH and RDP
+resource "aws_security_group" "wide_open" {
+  name        = "wide-open-sg"
+  description = "Intentionally overly permissive for testing"
 
-  security_rule {
-    name                       = "AllowSSHAll"
-    priority                   = 100
-    direction                  = "Inbound"
-    access                     = "Allow"
-    protocol                   = "Tcp"
-    source_port_range          = "*"
-    destination_port_range     = "22"
-    source_address_prefix      = "*"   # FLAW: open to any source
-    destination_address_prefix = "*"
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]   # FLAW: SSH open to internet
+  }
+
+  ingress {
+    from_port   = 3389
+    to_port     = 3389
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]   # FLAW: RDP open to internet
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 }
 
-# FLAW: unencrypted managed disk
-resource "azurerm_managed_disk" "unencrypted" {
-  name                 = "iac-test-disk"
-  location             = azurerm_resource_group.test.location
-  resource_group_name  = azurerm_resource_group.test.name
-  storage_account_type = "Standard_LRS"
-  create_option        = "Empty"
-  disk_size_gb         = 10
-  disk_encryption_set_id = null   # FLAW: no encryption set assigned
+# FLAW: RDS instance publicly accessible, unencrypted, weak password
+resource "aws_db_instance" "flawed" {
+  identifier          = "iac-test-db"
+  engine              = "mysql"
+  instance_class      = "db.t3.micro"
+  allocated_storage   = 20
+  username            = "admin"
+  password            = "password123"      # FLAW: hardcoded weak password
+  publicly_accessible = true               # FLAW: should be false
+  storage_encrypted   = false              # FLAW: should be true
+  skip_final_snapshot = true
+}
+
+# FLAW: IAM policy with wildcard action and resource
+resource "aws_iam_policy" "overly_permissive" {
+  name = "overly-permissive-policy"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = "*"        # FLAW: wildcard action
+        Resource = "*"        # FLAW: wildcard resource
+      }
+    ]
+  })
+}
+
+# FLAW: unencrypted EBS volume
+resource "aws_ebs_volume" "unencrypted" {
+  availability_zone = "us-east-1a"
+  size              = 10
+  encrypted         = false   # FLAW: should be true
+}
+
+# NOTE: this bucket IS correctly configured (control case, should NOT be flagged)
+resource "aws_s3_bucket" "secure_control" {
+  bucket = "iac-test-secure-bucket"
+}
+
+resource "aws_s3_bucket_public_access_block" "secure_control" {
+  bucket                  = aws_s3_bucket.secure_control.id
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "secure_control" {
+  bucket = aws_s3_bucket.secure_control.id
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
 }
